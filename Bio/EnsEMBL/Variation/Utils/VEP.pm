@@ -3142,19 +3142,17 @@ sub get_custom_annotation {
     my $config = shift;
     my $vf = shift;
     my $cache = shift;
-
     return $vf->{custom} if defined($vf->{custom});
 
     my $annotation = {};
 
     my $chr = $vf->{chr};
-
     if(!defined($cache)) {
         # spoof regions
         my $regions;
         $regions->{$chr} = [$vf->{start}.'-'.$vf->{end}];
         $cache = cache_custom_annotation($config, $regions, $chr);
-    }
+	}
 
     foreach my $custom(@{$config->{custom}}) {
 
@@ -3162,32 +3160,42 @@ sub get_custom_annotation {
 
         my ($s, $e) = ($vf->{start}, $vf->{end});
 
+        # get ref and alt if they are defined for the variant
+        my ($ref, $alt);
+        if(defined($vf->{original_allele_string})) {
+          ($ref, $alt) = split('/', $vf->{original_allele_string});
+        }
+
         # adjust start for BED as it is 0-based
         $s-- if $custom->{format} eq 'bed';
 
         # exact type must match coords of variant exactly
         if($custom->{type} eq 'exact') {
-
             foreach my $feature(values %{$cache->{$chr}->{$custom->{name}}->{$s}}) {
-
-                next unless
-                    $feature->{chr}   eq $chr &&
-                    $feature->{start} == $s &&
-                    $feature->{end}   == $e;
+              # a bool variable that indicates whether the ref and alt matches between variant and feature
+              #  default is 1/True, so that the lack of ref/alt means this bool should have no effect on the 
+              #  "next unless" conditional statement below
+              my $ref_alt_match_bool = 1;
+              if(defined($ref) and defined($alt) and defined($feature->{ref}) and defined($feature->{alt})) {
+                $ref_alt_match_bool = ($feature->{ref} eq $ref and $feature->{alt} eq $alt);
+              }
+              next unless
+                  $feature->{chr}   eq $chr &&
+                  $feature->{start} == $s &&
+                  $feature->{end}   == $e &&
+		              $ref_alt_match_bool;
 
                 $annotation->{$custom->{name}} .= $feature->{name}.',';
-
                 foreach my $field(@{$custom->{fields}}) {
                   $annotation->{$custom->{name}."_".$field} .= $feature->{$field}.',' if defined($feature->{$field});
                 }
-            }
+            } 
         }
 
         # overlap type only needs to overlap, but we need to search the whole range
         elsif($custom->{type} eq 'overlap') {
             foreach my $pos(keys %{$cache->{$chr}->{$custom->{name}}}) {
                 foreach my $feature(values %{$cache->{$chr}->{$custom->{name}}->{$pos}}) {
-
                     next unless
                         $feature->{chr}   eq $chr &&
                         $feature->{end}   >= $s &&
@@ -3207,7 +3215,6 @@ sub get_custom_annotation {
           $annotation->{$custom->{name}."_".$field} =~ s/\,$//g if defined($annotation->{$custom->{name}."_".$field});
         }
     }
-
     return $annotation;
 }
 
@@ -3544,7 +3551,6 @@ sub whole_genome_fetch_custom {
 
         foreach my $pos(keys %{$vf_hash->{$chr}{$chunk}}) {
             foreach my $vf(@{$vf_hash->{$chr}{$chunk}{$pos}}) {
-
                 $vf->{custom} = get_custom_annotation($config, $vf, $annotation_cache);
             }
         }
@@ -5957,12 +5963,15 @@ sub cache_custom_annotation {
     debug("Caching custom annotations") unless defined($config->{quiet});
 
     foreach my $custom(@{$config->{custom}}) {
+      # for each of the custom annotation provided
 
+        # get the array of regions
         my @regions = @{$include_regions->{$chr}};
 
         while(scalar @regions) {
             my $got_features = 0;
 
+            # if the number of regions > $max_regions_per_tabix, splice into multiple arrays
             my @tmp_regions = splice @regions, 0, $max_regions_per_tabix;
 
             progress($config, $counter, $total);
@@ -6015,13 +6024,11 @@ sub cache_custom_annotation {
 
                 while(<CUSTOM>) {
                     chomp;
-
                     # check for errors
                     if($error_flag) {
                         die "\nERROR: Problem using annotation file ".$custom->{file}."\n$_\n" if /invalid pointer|tabix|get_intv/;
                         $error_flag = 0;
                     }
-
                     my @data = split "\t", $_;
 
                     my $feature;
@@ -6037,14 +6044,15 @@ sub cache_custom_annotation {
 
                     elsif($custom->{format} eq 'vcf') {
                         my $tmp_vf = parse_vcf($config, $_)->[0];
-
-                        $feature = {
-                            chr    => $chr,
-                            start  => $tmp_vf->{start},
-                            end    => $tmp_vf->{end},
-                            name   => $tmp_vf->{variation_name} || '.',
-                        };
-
+			                  my ($ref, $alt) = split('/', $tmp_vf->{allele_string});
+                          $feature = {
+                              chr    => $chr,
+                              start  => $tmp_vf->{start},
+                              ref	   => $ref,
+                              alt    => $alt,
+                              end    => $tmp_vf->{end},
+                              name   => $tmp_vf->{variation_name} || '.',
+                          };
                         foreach my $field(@{$custom->{fields}}) {
                           if(m/$field\=(.+?)(\;|\s|$)/) {
                             $feature->{$field} = $1;
@@ -6129,9 +6137,13 @@ sub cache_custom_annotation {
                         $got_features = 1;
 
                         if(!defined($feature->{name}) || $feature->{name} eq '.' || $custom->{coords}) {
-                            $feature->{name} = $feature->{chr}.":".$feature->{start}."-".$feature->{end};
+                            # if ref and alt information are included in the custom annotation file, for example vcf
+                            my $name_suffix = "";
+                            if(defined($feature->{ref}) and defined($feature->{alt})) {
+                              $name_suffix = "-".$feature->{ref}."-".$feature->{alt};
+                            }
+                            $feature->{name} = $feature->{chr}.":".$feature->{start}."-".$feature->{end}.$name_suffix;
                         }
-
                         # add the feature to the cache
                         $annotation->{$chr}->{$custom->{name}}->{$feature->{start}}->{$feature->{name}} = $feature;
                     }
@@ -6148,7 +6160,6 @@ sub cache_custom_annotation {
     }
 
     end_progress($config);
-
     return $annotation;
 }
 
