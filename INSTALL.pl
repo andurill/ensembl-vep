@@ -31,97 +31,33 @@ limitations under the License.
 
 =head1 NAME
 
-INSTALL.pl - a script to install required code and data for VEP
+INSTALL.pl - a script to install required code and data for the VEP
+
+Version 86
 
 by Will McLaren (wm2@ebi.ac.uk)
 =cut
 
-use strict;
-use FindBin qw($RealBin);
-use lib $RealBin.'/modules';
 use Getopt::Long;
 use File::Path qw(mkpath rmtree);
 use File::Copy;
+use File::Copy::Recursive qw(dircopy);
 use File::Basename;
+use Archive::Extract;
 use Net::FTP;
 use Cwd;
-use Scalar::Util qw(looks_like_number);
-use Bio::EnsEMBL::VEP::Utils qw(get_version_data get_version_string);
-
-our (
-  $DEST_DIR,
-  $ENS_CVS_ROOT,
-  $API_VERSION,
-  $ASSEMBLY,
-  $ENS_GIT_ROOT,
-  $BIOPERL_URL,
-  $CACHE_URL,
-  $CACHE_DIR,
-  $PLUGINS,
-  $PLUGIN_URL,
-  $FASTA_URL,
-  $FTP_USER,
-  $HELP,
-  $NO_UPDATE,
-  $SPECIES,
-  $AUTO,
-  $QUIET,
-  $PREFER_BIN,
-  $CONVERT,
-  $TEST,
-  $NO_HTSLIB,
-  $LIB_DIR,
-  $HTSLIB_DIR,
-  $BIODBHTS_DIR,
-  $REALPATH_DEST_DIR,
-  $NO_TEST,
-  $NO_BIOPERL,
-  $ua,
-
-  $CAN_USE_CURL,
-  $CAN_USE_LWP,
-  $CAN_USE_HTTP_TINY,
-  $CAN_USE_ARCHIVE,
-  $CAN_USE_UNZIP,
-  $CAN_USE_GZIP,
-);
-
-## BEGIN BLOCK, CHECK WHAT MODULES ETC WE CAN USE
-#################################################
-
-BEGIN {
-  if(eval q{ use LWP::Simple qw(getstore get $ua); 1 }) {
-    $CAN_USE_LWP = 1;
-
-    # set up a user agent's proxy (excluding github)
-    $ua->env_proxy;
-  }
-
-  $CAN_USE_CURL      = 1 if `which curl` =~ /\/curl/;
-  $CAN_USE_HTTP_TINY = 1 if eval q{ use HTTP::Tiny; 1 };
-  $CAN_USE_ARCHIVE   = 1 if eval q{ use Archive::Extract; 1 };
-  $CAN_USE_UNZIP     = 1 if `which unzip` =~ /\/unzip/;
-  $CAN_USE_GZIP      = 1 if `which gzip` =~ /\/gzip/;
-}
+use strict;
 
 $| = 1;
+our $VERSION = 86;
+our $have_LWP;
+our $use_curl = 0;
+have_LWP();
 
 # CONFIGURE
 ###########
 
-# other global data
-my @API_MODULES = (
-  { name => 'ensembl',           path => '',          test_pm => 'Bio::EnsEMBL::Registry' },
-  { name => 'ensembl-variation', path => 'Variation', test_pm => 'Bio::EnsEMBL::Variation::Variation' },
-  { name => 'ensembl-funcgen',   path => 'Funcgen',   test_pm => 'Bio::EnsEMBL::Funcgen::RegulatoryFeature' },
-  { name => 'ensembl-io',        path => 'IO',        test_pm => 'Bio::EnsEMBL::IO::Parser' },
-);
-my $ensembl_url_tail = '/archive/';
-my $archive_type = '.zip';
-my $git_api_root = 'https://api.github.com/repos/Ensembl/';
-my $VEP_MODULE_NAME = 'ensembl-vep';
-
-our (@store_species, @indexes, @files, $ftp, $dirname);
+our ($DEST_DIR, $ENS_CVS_ROOT, $API_VERSION, $ASSEMBLY, $ENS_GIT_ROOT, $BIOPERL_URL, $CACHE_URL, $CACHE_DIR, $PLUGINS, $PLUGIN_URL, $FASTA_URL, $FTP_USER, $help, $UPDATE, $SPECIES, $AUTO, $QUIET, $PREFER_BIN, $CONVERT, $TEST, $NO_HTSLIB, $LIB_DIR, $HTSLIB_DIR, $BIODBHTS_DIR, $REALPATH_DEST_DIR );
 
 GetOptions(
   'DESTDIR|d=s'  => \$DEST_DIR,
@@ -131,8 +67,8 @@ GetOptions(
   'CACHEURL|u=s' => \$CACHE_URL,
   'CACHEDIR|c=s' => \$CACHE_DIR,
   'FASTAURL|f=s' => \$FASTA_URL,
-  'HELP|h'       => \$HELP,
-  'NO_UPDATE|n'  => \$NO_UPDATE,
+  'HELP|h'       => \$help,
+  'UPDATE|n'     => \$UPDATE,
   'SPECIES|s=s'  => \$SPECIES,
   'PLUGINS|g=s'  => \$PLUGINS,
   'PLUGINURL=s'  => \$PLUGIN_URL,
@@ -142,50 +78,102 @@ GetOptions(
   'CONVERT|t'    => \$CONVERT,
   'TEST'         => \$TEST,
   'NO_HTSLIB|l'  => \$NO_HTSLIB,
-  'NO_TEST'      => \$NO_TEST,
-  'NO_BIOPERL'   => \$NO_BIOPERL
+  'CURL'         => \$use_curl,
 ) or die("ERROR: Failed to parse arguments");
 
-# load version data
-our $CURRENT_VERSION_DATA = get_version_data($RealBin.'/.version');
-our $VERSION = $CURRENT_VERSION_DATA->{$VEP_MODULE_NAME}->{release};
-$VERSION =~ s/release\///;
-
-if($HELP) {
+if(defined($help)) {
   usage();
   exit(0);
 }
 
-my $default_dir_used = check_default_dir();
+my $default_dir_used;
+my $this_os =  $^O;
 
-$LIB_DIR            = $DEST_DIR;
-$HTSLIB_DIR         = $LIB_DIR.'/htslib';
-$BIODBHTS_DIR       = $LIB_DIR.'/biodbhts';
-$REALPATH_DEST_DIR .= Cwd::realpath($DEST_DIR).'/Bio';
-$DEST_DIR          .= '/Bio';
-$dirname            = dirname(__FILE__) || '.';
+# check if $DEST_DIR is default
+if(defined($DEST_DIR)) {
+  print "Using non-default API installation directory $DEST_DIR.\n";
+  print "Please note this just specifies the location for downloaded API files. The variant_effect_predictor.pl script will remain in its current location where ensembl-tools was unzipped.\n";
+  print "Have you \n";
+  print "1. added $DEST_DIR to your PERL5LIB environment variable?\n";
+  print "2. added $DEST_DIR/htslib to your PATH environment variable?\n";
+  if( $this_os eq 'darwin' && !$NO_HTSLIB) {
+    print "3. added $DEST_DIR/htslib to your DYLD_LIBRARY_PATH environment variable?\n";
+  }
+  print "(y/n)";
 
+  my $ok = <>;
+  if($ok !~ /^y/i) {
+    print "Exiting. Please \n";
+    print "1. add $DEST_DIR to your PERL5LIB environment variable\n";
+    print "2. add $DEST_DIR/htslib to your PATH environment variable\n";
+    if( $this_os eq 'darwin' && !$NO_HTSLIB) {
+      print "3. add $DEST_DIR/htslib to your DYLD_LIBRARY_PATH environment variable\n";
+    }
+    exit(0);
+  }
+  if( ! -d $DEST_DIR ) {
+    mkdir $DEST_DIR || die "Could not make destination directory $DEST_DIR"
+  }
+  $default_dir_used = 0;
+}
+
+else {
+  $DEST_DIR ||= '.';
+  $default_dir_used = 1;
+  my $current_dir = cwd();
+
+  if( !$NO_HTSLIB && $this_os eq 'darwin' ) {
+    print "Have you \n";
+    print "1. added $current_dir/htslib to your DYLD_LIBRARY_PATH environment variable?\n";
+    print "(y/n)";
+    my $ok = <>;
+    if($ok !~ /^y/i) {
+      print "Exiting. Please \n";
+      print "1. add $current_dir/htslib to your DYLD_LIBRARY_PATH environment variable\n";
+      exit(0);
+    }
+  }
+}
+
+$LIB_DIR = $DEST_DIR;
+
+$DEST_DIR       .= '/Bio';
+$REALPATH_DEST_DIR  .= Cwd::realpath($DEST_DIR);
 $ENS_GIT_ROOT ||= 'https://github.com/Ensembl/';
 $BIOPERL_URL  ||= 'https://github.com/bioperl/bioperl-live/archive/release-1-6-924.zip';
-$API_VERSION  ||= $CURRENT_VERSION_DATA->{$VEP_MODULE_NAME}->{release};
+$API_VERSION  ||= $VERSION;
+$CACHE_URL    ||= "ftp://ftp.ensembl.org/pub/release-$API_VERSION/variation/VEP";
 $CACHE_DIR    ||= $ENV{HOME} ? $ENV{HOME}.'/.vep' : 'cache';
+$PLUGIN_URL   ||= 'https://raw.githubusercontent.com/Ensembl/VEP_plugins';
 $FTP_USER     ||= 'anonymous';
+$FASTA_URL    ||= "ftp://ftp.ensembl.org/pub/release-$API_VERSION/fasta/";
+$PREFER_BIN     = 0 unless defined($PREFER_BIN);
+$HTSLIB_DIR   = $LIB_DIR.'/htslib';
+$BIODBHTS_DIR    = $LIB_DIR.'/biodbhts';
 
-$CACHE_URL  ||= "ftp://ftp.ensembl.org/pub/release-$API_VERSION/variation/VEP";
-$FASTA_URL  ||= "ftp://ftp.ensembl.org/pub/release-$API_VERSION/fasta/";
-$PLUGIN_URL ||= 'https://raw.githubusercontent.com/Ensembl/VEP_plugins';
+my $dirname = dirname(__FILE__) || '.';
+
+#dev
+
 
 # using PREFER_BIN can save memory when extracting archives
-$PREFER_BIN = 0 unless defined($PREFER_BIN);
 $Archive::Extract::PREFER_BIN = $PREFER_BIN == 0 ? 0 : 1;
 
-$QUIET = 0 unless $AUTO;
+$QUIET = 0 unless $UPDATE || $AUTO;
 
-# updates to ensembl-vep available?
-update() unless $NO_UPDATE;
+# set up the URLs
+my $ensembl_url_tail = '/archive/release/';
+my $archive_type = '.zip';
+
+our (@store_species, @indexes, @files, $ftp, $ua);
+
+# update?
+if($UPDATE) {
+  update();
+}
 
 # auto?
-if($AUTO) {
+elsif($AUTO) {
 
   # check
   die("ERROR: Failed to parse AUTO string - must contain any of a (API), l (FAIDX/htslib), c (cache), f (FASTA), p (plugins)\n") unless $AUTO =~ /^[alcfp]+$/i;
@@ -250,159 +238,12 @@ print "\nAll done\n" unless $QUIET;
 ##########################################################################
 
 
-# UPDATE
-########
-sub update() {
-
-  my $module = $VEP_MODULE_NAME;
-
-  # check for major version update
-  my $repo_file = "$RealBin/$$.repo_file";
-  download_to_file(
-    "$git_api_root$module",
-    $repo_file
-  );
-
-  my $default_branch;
-  open IN, $repo_file;
-  while(<IN>) {
-    if(/default_branch.+\:.+\"(.+?)\"/) {
-      $default_branch = $1;
-      last;
-    }
-  }
-  close IN;
-
-  unlink($repo_file);
-
-  unless($default_branch) {
-    print "WARNING: Unable to carry out version check for $module\n" unless $QUIET;
-    return;
-  }
-
-  my $default_branch_number = $default_branch;
-  $default_branch_number =~ s/release\/// if $default_branch_number;
-
-  my $current_branch = $CURRENT_VERSION_DATA->{'ensembl-vep'}->{release};
-
-  my $message;
-
-  # don't have latest
-  if($current_branch ne $default_branch_number) {
-    $message = 
-      "Version check reports a newer release of $module is available ".
-      "(installed: $current_branch, available: $default_branch)\n";
-  }
-
-  # do have latest, but there might be updates
-  else {
-    my $git_sub = get_vep_sub_version($current_branch);
-    my $have_sub = $CURRENT_VERSION_DATA->{$module}->{sub};
-
-    $message = sprintf(
-      "Version check reports there are post-release updates available of %s (installed: %s.%.7s, available: %s.%.7s)\n",
-      $module,
-      $current_branch, $have_sub,
-      $current_branch, $git_sub
-    ) unless $git_sub eq $have_sub;
-  }
-
-  if($message) {
-    print "\n$message\n";
-
-    # user has git, suggest they use that instead
-    if(`which git` && -d $RealBin.'/.git') {
-      print "You may use git to update $module by exiting this installer and running:\n\n";
-      print "git pull\n";
-      print "git checkout $default_branch\n" if $current_branch ne $default_branch_number;
-    }
-    else {
-      print "You should exit this installer and re-download $module if you wish to update\n";
-    }
-
-    print "\nDo you wish to exit so you can get updates (y) or continue (n): ";
-
-    my $ok = <>;
-
-    if($ok !~ /^n/i) {
-      print "OK, bye!\n";
-      print "\nNB: Remember to re-run INSTALL.pl after updating to check for API updates\n";
-      exit(0);
-    }
-  }
-  else {
-    return;
-  }
-}
-
-
-# CHECKS DIR SETUP AND PATHS ETC
-################################
-sub check_default_dir {
-  my $this_os =  $^O;
-  my $default_dir_used;
-
-  # check if $DEST_DIR is default
-  if(defined($DEST_DIR)) {
-    print "Using non-default API installation directory $DEST_DIR.\n";
-    print "Please note this just specifies the location for downloaded API files. The vep.pl script will remain in its current location where ensembl-vep was unzipped.\n";
-    print "Have you \n";
-    print "1. added $DEST_DIR to your PERL5LIB environment variable?\n";
-    print "2. added $DEST_DIR/htslib to your PATH environment variable?\n";
-    if( $this_os eq 'darwin' && !$NO_HTSLIB) {
-      print "3. added $DEST_DIR/htslib to your DYLD_LIBRARY_PATH environment variable?\n";
-    }
-    print "(y/n): ";
-
-    my $ok = <>;
-    if($ok !~ /^y/i) {
-      print "Exiting. Please \n";
-      print "1. add $DEST_DIR to your PERL5LIB environment variable\n";
-      print "2. add $DEST_DIR/htslib to your PATH environment variable\n";
-      if( $this_os eq 'darwin' && !$NO_HTSLIB) {
-        print "3. add $DEST_DIR/htslib to your DYLD_LIBRARY_PATH environment variable\n";
-      }
-      exit(0);
-    }
-    if( ! -d $DEST_DIR ) {
-      mkdir $DEST_DIR || die "Could not make destination directory $DEST_DIR"
-    }
-    $default_dir_used = 0;
-  }
-
-  else {
-    $DEST_DIR ||= '.';
-    $default_dir_used = 1;
-    my $current_dir = cwd();
-
-    if( !$NO_HTSLIB && $this_os eq 'darwin' ) {
-      print "Have you \n";
-      print "1. added $current_dir/htslib to your DYLD_LIBRARY_PATH environment variable?\n";
-      print "(y/n): ";
-      my $ok = <>;
-      if($ok !~ /^y/i) {
-        print "Exiting. Please \n";
-        print "1. add $current_dir/htslib to your DYLD_LIBRARY_PATH environment variable\n";
-        exit(0);
-      }
-    }
-  }
-
-  return $default_dir_used;
-}
-
-
 # API
 #####
 sub api() {
   setup_dirs();
   my $curdir = getcwd;
-  unless($NO_BIOPERL) {
-    bioperl();
-  }  
-
-  # htslib needs to find bioperl to pass tests
-  $ENV{PERL5LIB} = $ENV{PERL5LIB} ? $ENV{PERL5LIB}.':'.$DEST_DIR : $DEST_DIR;
+  bioperl();
 
   unless($NO_HTSLIB) {
     chdir $curdir;
@@ -411,7 +252,7 @@ sub api() {
 
   chdir $curdir;
   install_api();
-  test() unless $NO_TEST;
+  test();
 }
 
 
@@ -420,28 +261,37 @@ sub api() {
 sub check_api() {
   print "Checking for installed versions of the Ensembl API..." unless $QUIET;
 
-  my $has_api = {};
-  my $updates = {};
-  my $core_version;
+  # test if the user has the API installed
+  my $has_api = {
+    'ensembl' => 0,
+    'ensembl-variation' => 0,
+    'ensembl-functgenomics' => 0,
+  };
 
-  foreach my $module_hash(@API_MODULES) {
+  eval q{
+    use Bio::EnsEMBL::Registry;
+  };
 
-    my $module  = $module_hash->{name};
-    my $test_pm = $module_hash->{test_pm};
+  my $installed_version;
 
-    eval "require $test_pm";
-    $has_api->{$module} = $@ ? 0 : 1;
-    
-    if($has_api->{$module}) {
-      my $have_sub = $CURRENT_VERSION_DATA->{$module} ? ($CURRENT_VERSION_DATA->{$module}->{sub} || '') : '';
-      my $git_sub = get_module_sub_version($module);
-      $updates->{$module} = [$have_sub, $git_sub] if $have_sub ne $git_sub;
+  unless($@) {
+    $has_api->{ensembl} = 1;
 
-      if($module eq 'ensembl') {
-        $core_version = Bio::EnsEMBL::Registry->software_version;
-      }
-    }
+    $installed_version = Bio::EnsEMBL::Registry->software_version;
   }
+
+  eval q{
+    use Bio::EnsEMBL::Variation::Utils::VEP;
+  };
+
+  $has_api->{'ensembl-variation'} = 1 unless $@;
+
+  eval q{
+    use Bio::EnsEMBL::Funcgen::RegulatoryFeature;
+  };
+
+  $has_api->{'ensembl-functgenomics'} = 1 unless $@;
+
 
   print "done\n";
 
@@ -450,38 +300,19 @@ sub check_api() {
 
   my $message;
 
-  if($total == 4) {
+  if($total == 3) {
 
-    if(defined($core_version)) {
-      if(!looks_like_number($API_VERSION)) {
-        $message = "Your reported version ($API_VERSION) is a non-standard release number";
-      }
-      elsif($core_version == $API_VERSION) {
-
-        if(scalar keys %$updates) {
-          $message =
-            "There are updates avaiable for these modules:\n  ".
-            join(
-              "\n  ",
-              map {
-                sprintf(
-                  "%-20s : installed = %.7s, available = %.7s",
-                  $_, $updates->{$_}->[0], $updates->{$_}->[1]
-                )
-              } keys %$updates
-            );
-        }
-        else {
-          $message = "It looks like you already have v$API_VERSION of the API installed.\nYou shouldn't need to install the API";
-        }
+    if(defined($installed_version)) {
+      if($installed_version == $API_VERSION) {
+        $message = "It looks like you already have v$API_VERSION of the API installed.\nYou shouldn't need to install the API";
       }
 
-      elsif($core_version > $API_VERSION) {
-        $message = "It looks like this installer is for an older distribution ($API_VERSION) of the API than you already have ($core_version)";
+      elsif($installed_version > $API_VERSION) {
+        $message = "It looks like this installer is for an older distribution of the API than you already have";
       }
 
       else {
-        $message = "It looks like you have an older version ($core_version) of the API installed.\nThis installer will install a limited set of the API v$API_VERSION for use by the VEP only";
+        $message = "It looks like you have an older version (v$installed_version) of the API installed.\nThis installer will install a limited set of the API v$API_VERSION for use by the VEP only";
       }
     }
 
@@ -491,7 +322,7 @@ sub check_api() {
   }
 
   elsif($total > 0) {
-    $message = "It looks like you already have the following API modules installed:\n\n".(join "\n", grep {$has_api->{$_}} keys %$has_api)."\n\nThe VEP requires the ensembl, ensembl-io, ensembl-variation and ensembl-funcgen modules";
+    $message = "It looks like you already have the following API modules installed:\n\n".(join "\n", grep {$has_api->{$_}} keys %$has_api)."\n\nThe VEP requires the ensembl, ensembl-variation and optionally ensembl-functgenomics modules";
   }
 
   if(defined($message)) {
@@ -566,100 +397,56 @@ sub install_api() {
 
   print "\nDownloading required Ensembl API files\n" unless $QUIET;
 
-  my $release_url_string = looks_like_number($API_VERSION) ? 'release/'.$API_VERSION : $API_VERSION;
-  my $release_path_string = looks_like_number($API_VERSION) ? 'release-'.$API_VERSION : $API_VERSION;
-
-  foreach my $module_hash(@API_MODULES) {
-    my $module = $module_hash->{name};
-    my $module_dir_suffix = $module_hash->{path} ? '/'.$module_hash->{path} : '';
-
-    # do we need to update this?
-    my $have_sub = $CURRENT_VERSION_DATA->{$module} ? ($CURRENT_VERSION_DATA->{$module}->{sub} || '') : '';
-
-    my $url = $ENS_GIT_ROOT.$module.$ensembl_url_tail.$release_url_string.$archive_type;
+  foreach my $module(qw(ensembl ensembl-variation ensembl-funcgen)) {
+    my $url = $ENS_GIT_ROOT.$module.$ensembl_url_tail.$API_VERSION.$archive_type;
 
     print " - fetching $module\n" unless $QUIET;
     my $target_file = $DEST_DIR.'/tmp/'.$module.$archive_type;
-    mkdir($DEST_DIR.'/tmp/') unless -d $DEST_DIR.'/tmp/';
-    download_to_file($url, $target_file) unless -e $target_file;
+
+    if(!-e $DEST_DIR.'/tmp/')
+    {
+        mkdir( $DEST_DIR.'/tmp/' );
+    }
+
+    if(!-e $target_file) {
+      download_to_file($url, $target_file);
+    }
 
     print " - unpacking $target_file\n" unless $QUIET;
     unpack_arch("$DEST_DIR/tmp/$module$archive_type", "$DEST_DIR/tmp/");
 
     print " - moving files\n" unless $QUIET;
 
-    move(
-      "$DEST_DIR/tmp/$module\-$release_path_string/modules/Bio/EnsEMBL$module_dir_suffix",
-      "$DEST_DIR/EnsEMBL$module_dir_suffix"
-    ) or die "ERROR: Could not move directory\n".$!;
-
-    # now get latest commit from github API
-    print " - getting version information\n" unless $QUIET;
-    my $git_sub = get_module_sub_version($module);
-
-    mkdir("$RealBin/.version/") unless -d "$RealBin/.version/";
-    open OUT, ">$RealBin/.version/$module" or die $!;
-    print OUT "release $API_VERSION\nsub $git_sub\n";
-    close OUT;
-
-    rmtree("$DEST_DIR/tmp/$module\-$release_path_string") or die "ERROR: Failed to remove directory: $!\n";
-  }
-}
-
-sub get_module_sub_version {
-  my $module = shift;
-
-  my $sub_file = "$RealBin/$$\.$module.sub";
-  my $release_url_string = looks_like_number($API_VERSION) ? 'release/'.$API_VERSION : $API_VERSION;
-
-  download_to_file(
-    "$git_api_root$module/commits?sha=$release_url_string",
-    $sub_file
-  );
-
-  open IN, $sub_file or die $!;
-  my $sub;
-  while(<IN>) {
-    if(/\"sha\": \"(.+?)\"/) {
-      $sub = $1;
-      last;
+    if($module eq 'ensembl') {
+      move("$DEST_DIR/tmp/$module\-release\-$API_VERSION/modules/Bio/EnsEMBL", "$DEST_DIR/EnsEMBL") or die "ERROR: Could not move directory\n".$!;
     }
-  }
-  close IN;
+    elsif($module eq 'ensembl-variation') {
+      move("$DEST_DIR/tmp/$module\-release-$API_VERSION/modules/Bio/EnsEMBL/Variation", "$DEST_DIR/EnsEMBL/Variation") or die "ERROR: Could not move directory\n".$!;
 
-  unlink($sub_file);
+      # move test data
+      my $test_target = "$DEST_DIR/../t/testdata/";
+      mkpath($test_target) unless -d $test_target;
 
-  return $sub;
-}
+      opendir TESTDATA, "$DEST_DIR/tmp/$module\-release-$API_VERSION/modules/t/testdata" or die "ERROR: Could not find ensembl-variation/modules/t/testdata directory";
 
-sub get_vep_sub_version {
-  my $release = shift || $API_VERSION;
+      foreach my $f(grep {!/^\./} readdir TESTDATA) {
+        if(-d $test_target.$f) {
+          rmtree($test_target.$f) or die "ERROR: Could not remove $test_target$f\n".$!;
+        }
+        elsif(-e $test_target.$f) {
+          unlink($test_target.$f) or die "ERROR: Could not remove $test_target$f\n".$!;
+        }
 
-  my $sub_file = "$RealBin/$$\.$VEP_MODULE_NAME.sub";
-  my $release_url_string = looks_like_number($API_VERSION) ? 'release/'.$API_VERSION : $API_VERSION;
-
-  download_to_file(
-    sprintf(
-      'https://raw.githubusercontent.com/Ensembl/%s/%s/modules/Bio/EnsEMBL/VEP/Constants.pm',
-      $VEP_MODULE_NAME,
-      $release_url_string
-    ),
-    $sub_file
-  );
-
-  open IN, $sub_file or die $!;
-  my $sub;
-  while(<IN>) {
-    if(/VEP_SUB_VERSION \= (.+)\;/) {
-      $sub = $1;
-      last;
+        move("$DEST_DIR/tmp/$module\-release-$API_VERSION/modules/t/testdata/$f", $test_target.$f) or die "ERROR: Could not move $DEST_DIR/tmp/$module\-release-$API_VERSION/modules/t/testdata/$f to $test_target$f".$!;
+      }
+      closedir TESTDATA;
     }
+    elsif($module eq 'ensembl-funcgen') {
+      move("$DEST_DIR/tmp/$module\-release-$API_VERSION/modules/Bio/EnsEMBL/Funcgen", "$DEST_DIR/EnsEMBL/Funcgen") or die "ERROR: Could not move directory\n".$!;
+    }
+
+    rmtree("$DEST_DIR/tmp/$module\-release-$API_VERSION") or die "ERROR: Failed to remove directory $DEST_DIR/tmp/$module\-release-$API_VERSION\n";
   }
-  close IN;
-
-  unlink($sub_file);
-
-  return $sub;
 }
 
 # HTSLIB download/make
@@ -668,7 +455,7 @@ sub install_htslib() {
 
   #actually decided to follow Bio::DB::Sam template
   # STEP 0: various dependencies
-  my $git = `which git`;
+  my $git = 'which git';
   $git or die <<END;
   'git' command not in path. Please install git and try again.
   (or to skip Bio::DB::HTS/htslib install re-run with --NO_HTSLIB)
@@ -679,7 +466,7 @@ sub install_htslib() {
 END
 
 
-  `which cc` or die <<END;
+  'which cc' or die <<END;
   'cc' command not in path. Please install it and try again.
   (or to skip Bio::DB::HTS/htslib install re-run with --NO_HTSLIB)
 
@@ -718,7 +505,7 @@ END
 
   # STEP 2: Check out HTSLIB / or make this a download?
   print(" - checking out HTSLib\n");
-  system "git clone -b 1.3.2 https://github.com/samtools/htslib.git";
+  system "git clone -b master https://github.com/samtools/htslib.git";
   -d './htslib' or die "git clone seems to have failed. Could not find $htslib_install_dir/htslib directory";
   chdir './htslib';
 
@@ -834,26 +621,6 @@ sub install_biodbhts() {
   chdir $pdir;
 }
 
-sub dircopy {
-  my ($from, $to) = @_;
-
-  opendir FROM, $from;
-
-  foreach my $file(grep {!/^\.\.?/} readdir FROM) {
-
-    # dir?
-    if(-d "$from/$file") {
-      mkdir("$to/$file") unless -d "$to/$file";
-      dircopy("$from/$file", "$to/$file");
-    }
-    else {
-      copy("$from/$file", "$to/$file");
-    }
-  }
-
-  closedir FROM;
-}
-
 
 # INSTALL BIOPERL
 #################
@@ -896,22 +663,19 @@ sub bioperl() {
 ######
 sub test() {
 
-  print "\nTesting VEP installation\n" unless $QUIET;
+  print "\nTesting VEP script\n" unless $QUIET;
 
-  eval q{use Test::Harness; use Test::Exception; };
+  eval q{use Test::Harness};
   if(!$@) {
+    $ENV{PERL5LIB} = $ENV{PERL5LIB} ? $ENV{PERL5LIB}.':'.$DEST_DIR : $DEST_DIR;
     opendir TEST, "$dirname\/t";
-    my @test_files = map {"$dirname\/t\/".$_} grep {!/^\./ && /\.t$/} readdir TEST;
+    my @test_files = map {"$dirname\/t\/".$_} grep {!/_db/ && !/^\./ && /\.t$/} readdir TEST;
     closedir TEST;
-
-    # haplo.pl tests require Set::IntervalTree which is not installed here
-    eval q{use Set::IntervalTree};
-    @test_files = grep {!/Haplo/} @test_files if $@;
 
     print "Warning: Tests failed, VEP may not run correctly\n" unless runtests(@test_files);
   }
   else {
-    my $test_vep = `perl -I $DEST_DIR $dirname/vep.pl --help 2>&1`;
+    my $test_vep = `perl -I $DEST_DIR $dirname/variant_effect_predictor.pl --help 2>&1`;
 
     $test_vep =~ /ENSEMBL VARIANT EFFECT PREDICTOR/ or die "ERROR: Testing VEP script failed with the following error\n$test_vep\n";
   }
@@ -1294,9 +1058,8 @@ sub fasta() {
     die("ERROR: Unable to parse assembly name from $file\n") unless $assembly;
 
     my $ex = "$CACHE_DIR/$orig_species/$API_VERSION\_$assembly/$file";
-    my $ex_unpacked = $ex;
-    $ex_unpacked =~ s/\.gz$//;
-    if(-e $ex || -e $ex_unpacked) {
+    $ex =~ s/\.gz$//;
+    if(-e $ex) {
       print "Looks like you already have the FASTA file for $orig_species, skipping\n" unless $QUIET;
 
       if($ftp) {
@@ -1314,43 +1077,17 @@ sub fasta() {
     if($ftp) {
       print " - downloading $file\n" unless $QUIET;
       if(!$TEST) {
-        $ftp->get($file, $ex) or download_to_file("$FASTA_URL/$species/dna/$file", $ex);
+        $ftp->get($file, "$CACHE_DIR/$orig_species/$API_VERSION\_$assembly/$file") or download_to_file("$FASTA_URL/$species/dna/$file", "$CACHE_DIR/$orig_species/$API_VERSION\_$assembly/$file");
       }
     }
     else {
       print " - copying $file\n" unless $QUIET;
-      copy("$FASTA_URL/$species/dna/$file", $ex) unless $TEST;
+      copy("$FASTA_URL/$species/dna/$file", "$CACHE_DIR/$orig_species/$API_VERSION\_$assembly/$file") unless $TEST;
     }
 
-    my $bgzip = `which bgzip`;
-    chomp($bgzip);
-    $bgzip ||= "$HTSLIB_DIR/bgzip";
-
-    eval q{ use Bio::DB::HTS::Faidx; };
-    my $can_use_faidx = $@ ? 0 : 1;
-
-    if($can_use_faidx && -e $bgzip && $CAN_USE_GZIP) {
-      print " - converting sequence data to bgzip format, this may take some time...\n" unless $QUIET;
-      my $curdir = getcwd;
-      my $bgzip_convert = "gzip -dc $ex | $bgzip -c > $ex\.bgz; mv $ex\.bgz $ex";
-      my $bgzip_result = `$bgzip_convert` unless $TEST;
-
-      if( $? != 0 ) {
-        die "FASTA gzip to bgzip conversion failed: $bgzip_result\n" unless $TEST;
-      }
-      else {
-        print " - conversion successful\n";
-      }
-
-      Bio::DB::HTS::Faidx->new($ex) unless $TEST;
-      print " - indexing OK\n" unless $QUIET;
-
-      print "\nThe FASTA file should be automatically detected by the VEP when using --cache or --offline.\nIf it is not, use \"--fasta $ex\"\n\n" unless $QUIET;
-    }
-
-    elsif($NO_HTSLIB) {
+    if($NO_HTSLIB) {
       print " - extracting data\n" unless $QUIET;
-      unpack_arch($ex, "$CACHE_DIR/$orig_species/$API_VERSION\_$assembly/") unless $TEST;
+      unpack_arch("$CACHE_DIR/$orig_species/$API_VERSION\_$assembly/$file", "$CACHE_DIR/$orig_species/$API_VERSION\_$assembly/") unless $TEST;
 
       print " - attempting to index\n" unless $QUIET;
       eval q{
@@ -1360,11 +1097,41 @@ sub fasta() {
         print "Indexing failed - VEP will attempt to index the file the first time you use it\n" unless $QUIET;
       }
       else {
-        Bio::DB::Fasta->new($ex_unpacked) unless $TEST;
+        Bio::DB::Fasta->new($ex) unless $TEST;
         print " - indexing OK\n" unless $QUIET;
       }
 
-      print "\nThe FASTA file should be automatically detected by the VEP when using --cache or --offline.\nIf it is not, use \"--fasta $ex_unpacked\"\n\n" unless $QUIET;
+      print "The FASTA file should be automatically detected by the VEP when using --cache or --offline. If it is not, use \"--fasta $ex\"\n\n" unless $QUIET;
+    }
+
+    else {
+      print " - converting sequence data to bgzip format\n" unless $QUIET;
+      my $curdir = getcwd;
+      my $bgzip_convert = "$BIODBHTS_DIR/scripts/convert_gz_2_bgz.sh "."$ex.gz $HTSLIB_DIR/bgzip";
+      print " Going to run:\n$bgzip_convert\nThis may take some time and will be removed when files are provided in bgzip format\n";
+      my $bgzip_result = `/bin/bash $bgzip_convert` unless $TEST;
+
+      if( $? != 0 ) {
+        die "FASTA gzip to bgzip conversion failed: $bgzip_result\n" unless $TEST;
+      }
+      else {
+        print "Converted FASTA gzip file to bgzip successfully\n";
+      }
+
+      #Indexing needs Faidx, but this will not be present when the script is started up.
+      eval q{
+        use Bio::DB::HTS::Faidx;
+      };
+
+      if($@) {
+        print "Indexing failed - VEP will attempt to index the file the first time you use it\n" unless $QUIET;
+      }
+      else {
+        Bio::DB::HTS::Faidx->new("$ex.gz") unless $TEST;
+        print " - indexing OK\n" unless $QUIET;
+      }
+
+      print "The FASTA file should be automatically detected by the VEP when using --cache or --offline. If it is not, use \"--fasta $ex.gz\"\n\n" unless $QUIET;
     }
 
     if($ftp) {
@@ -1373,6 +1140,86 @@ sub fasta() {
     }
   }
 }
+
+
+# UPDATE
+########
+sub update() {
+  eval q{ use JSON; };
+  die("ERROR: Updating requires JSON Perl module\n$@") if $@;
+
+  print "Checking for newer version of the VEP\n";
+
+  eval q{
+    use HTTP::Tiny;
+  };
+  die("ERROR: Updating requires HTTP::Tiny Perl module\n$@") if $@;
+  my $http = HTTP::Tiny->new();
+
+  my $server = 'http://rest.ensembl.org';
+  my $ext = '/info/software?';
+  my $response = $http->get($server.$ext, {
+    headers => { 'Content-type' => 'application/json' }
+  });
+
+  die "ERROR: Failed to fetch software version number!\n" unless $response->{success};
+
+  if(length $response->{content}) {
+    my $hash = decode_json($response->{content});
+    die("ERROR: Failed to get software version from JSON response\n") unless defined($hash->{release});
+
+    if($hash->{release} > $VERSION) {
+
+      print "Ensembl reports there is a newer version of the VEP ($hash->{release}) available - do you want to download? ";
+
+      my $ok = <>;
+
+      if($ok !~ /^y/i) {
+        print "OK, bye!\n";
+        exit(0);
+      }
+
+      my $url = $ENS_GIT_ROOT.'ensembl-tools'.$ensembl_url_tail.$hash->{release}.$archive_type;
+
+      my $tmpdir = '.'.$$.'_tmp';
+      mkdir($tmpdir);
+
+      print "Downloading version $hash->{release}\n";
+      download_to_file($url, $tmpdir.'/variant_effect_predictor'.$archive_type);
+
+      print "Unpacking\n";
+      unpack_arch($tmpdir.'/variant_effect_predictor'.$archive_type, $tmpdir);
+      unlink($tmpdir.'/variant_effect_predictor'.$archive_type);
+
+      opendir NEWDIR, $tmpdir.'/ensembl-tools-release-'.$hash->{release}.'/scripts/variant_effect_predictor';
+      my @new_files = grep {!/^\./} readdir NEWDIR;
+      closedir NEWDIR;
+
+      foreach my $new_file(@new_files) {
+        if(-e $new_file || -d $new_file) {
+          print "Backing up $new_file to $new_file\.bak\_$VERSION\n";
+          move($new_file, "$new_file\.bak\_$VERSION");
+          move($tmpdir.'/ensembl-tools-release-'.$hash->{release}.'/scripts/variant_effect_predictor/'.$new_file, $new_file);
+        }
+        else {
+          print "Copying file $new_file\n";
+          move($tmpdir.'/ensembl-tools-release-'.$hash->{release}.'/scripts/variant_effect_predictor/'.$new_file, $new_file);
+        }
+      }
+
+      rmtree($tmpdir);
+
+      print "\nLooks good! Rerun INSTALL.pl to update your API and/or get the latest cache files\n";
+      exit(0);
+    }
+    else {
+      print "Looks like you have the latest version - no need to update!\n\n";
+      print "There may still be post-release patches to the API - run INSTALL.pl without --UPDATE/-n to re-install your API\n";
+      exit(0);
+    }
+  }
+}
+
 
 # PLUGINS
 #########
@@ -1586,11 +1433,13 @@ sub download_to_file {
 
   $url =~ s/([a-z])\//$1\:21\// if $url =~ /ftp/ && $url !~ /\:21/;
 
-  if($CAN_USE_CURL) {
-    my $output = `curl -s --location $url > $file`;
+  # print STDERR "Downloading $url to $file\n";
+
+  if($use_curl) {
+    my $output = `curl --location $url > $file`;
   }
 
-  elsif($CAN_USE_LWP) {
+  elsif(have_LWP()) {
     my $response = getstore($url, $file);
 
     unless($response == 200) {
@@ -1601,13 +1450,14 @@ sub download_to_file {
       $response = getstore($url, $file);
 
       unless($response == 200) {
-        print "LWP::Simple failed ($response), trying to fetch using HTTP::Tiny\n" unless $QUIET;
-        $CAN_USE_LWP = 0;
+        #warn "WARNING: Failed to fetch from $url\nError code: $response\n" unless $QUIET;
+        print "Trying to fetch using curl\n" unless $QUIET;
+        $use_curl = 1;
         download_to_file($url, $file);
       }
     }
   }
-  elsif($CAN_USE_HTTP_TINY) {
+  else {
     my $response = HTTP::Tiny->new(no_proxy => 'github.com')->get($url);
 
     if($response->{success}) {
@@ -1627,12 +1477,44 @@ sub download_to_file {
         close OUT;
       }
       else {
-        die("ERROR: Failed last resort of using HTTP::Tiny to download $url\n");
+        #warn "WARNING: Failed to fetch from $url\nError code: $response->{reason}\nError content:\n$response->{content}\n" unless $QUIET;
+        print "Trying to fetch using curl\n" unless $QUIET;
+        $use_curl = 1;
+        download_to_file($url, $file);
       }
     }
   }
+}
+
+sub have_LWP {
+  return $have_LWP if defined($have_LWP);
+
+  eval q{
+    use LWP::Simple qw(getstore get $ua);
+  };
+
+  if($@) {
+    $have_LWP = 0;
+    warn("Using HTTP::Tiny - this may fail when downloading large files; install LWP::Simple to avoid this issue\n");
+
+    eval q{
+      use HTTP::Tiny;
+    };
+
+    if($@) {
+      die("ERROR: No suitable package installed - this installer requires either HTTP::Tiny or LWP::Simple\n");
+    }
+  }
   else {
-    die("ERROR: Unable to download files without curl, LWP or HTTP::Tiny installed\n");
+    $have_LWP = 1;
+
+    # set up a user agent's proxy (excluding github)
+    $ua->env_proxy;
+
+    # enable progress
+    eval q{
+      $ua->show_progress(1);
+    } unless $QUIET;
   }
 }
 
@@ -1640,38 +1522,18 @@ sub download_to_file {
 sub unpack_arch {
   my ($arch_file, $dir) = @_;
 
-  if($CAN_USE_ARCHIVE) {
-    my $ar = Archive::Extract->new(archive => $arch_file);
-    my $ok = $ar->extract(to => $dir) or die $ar->error;
-  }
-  else {
-    if($arch_file =~ /.zip$/ && $CAN_USE_UNZIP) {
-      `unzip $arch_file -d $dir`;
-    }
-    elsif($arch_file =~ /\.gz$/ && $CAN_USE_GZIP) {
-      my $unpacked = $arch_file;
-      $unpacked =~ s/.*\///g;
-      $unpacked =~ s/\.gz$//;
-      `gzip -dc $arch_file > $dir/$unpacked`;
-    }
-    else {
-      die("ERROR: Unable to unpack file $arch_file without Archive::Extract or unzip/gzip\n");
-    }
-  }
-
+  my $ar = Archive::Extract->new(archive => $arch_file);
+  my $ok = $ar->extract(to => $dir) or die $ar->error;
   unlink($arch_file);
 }
 
 sub usage {
-  my $versions = get_version_string();
-
-  my $usage =<<END;
+    my $usage =<<END;
 #---------------#
 # VEP INSTALLER #
 #---------------#
 
-versions
-  $versions
+version $VERSION
 
 By Will McLaren (wm2\@ebi.ac.uk)
 
@@ -1689,17 +1551,17 @@ Options
 -v | --VERSION     Set API version to install (default = $VERSION)
 -c | --CACHEDIR    Set destination directory for cache files (default = '$ENV{HOME}/.vep/')
 
+-n | --UPDATE      EXPERIMENTAL! Check for and download new VEP versions
+
 -a | --AUTO        Run installer without user prompts. Use "a" (API + Faidx/htslib),
                    "l" (Faidx/htslib only), "c" (cache), "f" (FASTA), "p" (plugins) to specify
                    parts to install e.g. -a ac for API and cache
--n | --NO_UPDATE   Do not check for updates to ensembl-vep
 -s | --SPECIES     Comma-separated list of species to install when using --AUTO
 -y | --ASSEMBLY    Assembly name to use if more than one during --AUTO
 -g | --PLUGINS     Comma-separated list of plugins to install when using --AUTO
 -q | --QUIET       Don't write any status output when using --AUTO
 -p | --PREFER_BIN  Use this if the installer fails with out of memory errors
 -l | --NO_HTSLIB   Don't attempt to install Faidx/htslib
---NO_BIOPERL       Don't install BioPerl
 
 -t | --CONVERT     Convert downloaded caches to use tabix for retrieving
                    co-located variants (requires tabix)
@@ -1713,5 +1575,5 @@ Options
                    [species]/[dna]/
 END
 
-  print $usage;
+    print $usage;
 }
