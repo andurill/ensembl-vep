@@ -3152,7 +3152,7 @@ sub get_custom_annotation {
         my $regions;
         $regions->{$chr} = [$vf->{start}.'-'.$vf->{end}];
         $cache = cache_custom_annotation($config, $regions, $chr);
-	}
+    }
 
     foreach my $custom(@{$config->{custom}}) {
 
@@ -3183,13 +3183,13 @@ sub get_custom_annotation {
                   $feature->{chr}   eq $chr &&
                   $feature->{start} == $s &&
                   $feature->{end}   == $e &&
-		              $ref_alt_match_bool;
+		  $ref_alt_match_bool;
 
                 $annotation->{$custom->{name}} .= $feature->{name}.',';
                 foreach my $field(@{$custom->{fields}}) {
                   $annotation->{$custom->{name}."_".$field} .= $feature->{$field}.',' if defined($feature->{$field});
                 }
-            } 
+            }
         }
 
         # overlap type only needs to overlap, but we need to search the whole range
@@ -6044,18 +6044,21 @@ sub cache_custom_annotation {
 
                     elsif($custom->{format} eq 'vcf') {
                         my $tmp_vf = parse_vcf($config, $_)->[0];
-			                  my ($ref, $alt) = split('/', $tmp_vf->{allele_string});
+			my ($ref, $alt) = split('/', $tmp_vf->{allele_string});
                           $feature = {
                               chr    => $chr,
                               start  => $tmp_vf->{start},
-                              ref	   => $ref,
+                              ref    => $ref,
                               alt    => $alt,
                               end    => $tmp_vf->{end},
                               name   => $tmp_vf->{variation_name} || '.',
                           };
                         foreach my $field(@{$custom->{fields}}) {
-                          if(m/$field\=(.+?)(\;|\s|$)/) {
-                            $feature->{$field} = $1;
+			  # Match the entire field name with regex when querying for values,
+			  #  in case multiple field names with overlapping substrings exist.
+			  #  example: AF_nfe and controls_AF_nfe
+			  if(m/(^|\;|\s)$field\=(.+?)(\;|\s|$)/) {
+                            $feature->{$field} = $2;
                           }
                         }
 
@@ -6137,7 +6140,8 @@ sub cache_custom_annotation {
                         $got_features = 1;
 
                         if(!defined($feature->{name}) || $feature->{name} eq '.' || $custom->{coords}) {
-                            # if ref and alt information are included in the custom annotation file, for example vcf
+                            # if ref and alt information are included in the custom annotation file, for example vcf,
+			    #  then include those identifiers in the name key.
                             my $name_suffix = "";
                             if(defined($feature->{ref}) and defined($feature->{alt})) {
                               $name_suffix = "-".$feature->{ref}."-".$feature->{alt};
